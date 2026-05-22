@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "allen-mouse-connectivity"
+version = "0.1.0"
+description = "Build a mouse structural connectivity matrix from Allen Institute tracer experiments — standalone CLI, no TVB required."
+readme = "README.md"
+license = {text = "GPL-3.0-or-later"}
+requires-python = ">=3.9"
+authors = [
+    {name = "Francesca Melozzi", email = "france.melozzi@gmail.com"},
+    {name = "Marmaduke Woodman", email = "marmaduke.woodman@univ-amu.fr"},
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+
+dependencies = [
+    "numpy>=1.20",
+    "allensdk>=2.0",
+]
+
+[project.scripts]
+allen-mouse-connectivity = "allen_mouse_connectivity.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/maedoc/allen-mouse-connectivity"
+Source = "https://github.com/maedoc/allen-mouse-connectivity"
+
+[tool.setuptools.packages.find]
+where = ["src"]
