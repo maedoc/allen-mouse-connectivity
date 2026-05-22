@@ -28,3 +28,22 @@ jobs:
 
       - name: Run smoke tests
         run: uv run python tests/test_smoke.py
+
+  pip-install:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install from git
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install git+https://github.com/${{ github.repository }}.git@${{ github.sha }}
+
+      - name: Verify import
+        run: |
+          .venv/bin/python -c "from allen_mouse_connectivity import build_connectivity; print('✓ git install OK')"
