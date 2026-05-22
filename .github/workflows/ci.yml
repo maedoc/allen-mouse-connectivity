@@ -22,7 +22,8 @@ jobs:
 
       - name: Create venv and install dependencies
         run: |
-          uv venv
+          uv python install 3.11
+          uv venv --python 3.11
           uv pip install -e .
 
       - name: Run smoke tests
