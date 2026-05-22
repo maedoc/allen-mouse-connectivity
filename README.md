@@ -32,10 +32,9 @@ the entire TVB stack, this tool provides:
 ## Installation
 
 ```bash
-git clone git@github.com:maedoc/allen-mouse-connectivity.git
-cd allen-mouse-connectivity
-uv sync
+python -m venv .venv
 source .venv/bin/activate
+GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=clone.depth GIT_CONFIG_VALUE_0=1 python -m pip install "git+https://github.com/maedoc/allen-mouse-connectivity.git"
 ```
 
 Or, from PyPI (once published):

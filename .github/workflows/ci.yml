@@ -20,11 +20,17 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Create venv and install dependencies
+      - name: Create venv
         run: |
           uv python install 3.11
           uv venv --python 3.11
-          uv pip install -e .
+
+      - name: Install from git+https (depth=1 style)
+        run: |
+          source .venv/bin/activate
+          GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=clone.depth GIT_CONFIG_VALUE_0=1 python -m pip install "git+https://github.com/${{ github.repository }}.git@${{ github.sha }}"
 
       - name: Run smoke tests
-        run: uv run python tests/test_smoke.py
+        run: |
+          source .venv/bin/activate
+          python tests/test_smoke.py
