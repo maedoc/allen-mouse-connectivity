@@ -102,13 +102,14 @@ def build_connectivity(resolution=100,
 
     # 1 — Build experiment dictionary ------------------------------------------
     _report(progress_callback, "Building experiment dictionary")
-    ist2e = dictionary_builder(cache, transgenic_line)
+    ist2e, experiments_df = dictionary_builder(cache, transgenic_line)
 
     # 2 — Download projection matrices -----------------------------------------
     _report(progress_callback, "Downloading projection matrices",
             {"injection_sites": len(ist2e)})
     projmaps = download_an_construct_matrix(cache, weighting, ist2e,
-                                            transgenic_line)
+                                            transgenic_line,
+                                            experiments_df=experiments_df)
 
     # 3 — Clean projection maps ------------------------------------------------
     _report(progress_callback, "Cleaning projection maps",
@@ -193,7 +194,14 @@ def _report(callback, stage, info=None):
 # ---------------------------------------------------------------------------
 
 def dictionary_builder(mcc, transgenic_line):
-    """Build a dict mapping injection-structure-id → list of experiment ids."""
+    """Build a dict mapping injection-structure-id → list of experiment ids.
+
+    Returns
+    -------
+    tuple[dict, DataFrame]
+        The ``ist2e`` mapping and the experiment DataFrame (reused later for
+        injection density lookups, avoiding a second API call).
+    """
     all_experiments = mcc.get_experiments(dataframe=True, cre=transgenic_line)
     ist2e = {}
     for eid in all_experiments.index:
@@ -201,11 +209,27 @@ def dictionary_builder(mcc, transgenic_line):
         if isti not in ist2e:
             ist2e[isti] = []
         ist2e[isti].append(eid)
-    return ist2e
+    return ist2e, all_experiments
 
 
-def download_an_construct_matrix(mcc, weighting, ist2e, transgenic_line):
-    """Download projection matrices and (optionally) injection densities."""
+def download_an_construct_matrix(mcc, weighting, ist2e, transgenic_line,
+                                 experiments_df=None):
+    """Download projection matrices and (optionally) injection densities.
+
+    Parameters
+    ----------
+    mcc : MouseConnectivityCache
+    weighting : int
+        1 = PD/ID, 2 = PD, 3 = energy.
+    ist2e : dict
+        Mapping from injection structure id → list of experiment ids.
+    transgenic_line : bool or str
+        Cre line filter.
+    experiments_df : DataFrame or None
+        If supplied (from :func:`dictionary_builder`), used for injection
+        density lookups instead of a separate API call.  Avoids potential
+        ordering mismatches between two independent ``get_experiments`` calls.
+    """
     projmaps = {}
     if weighting == 3:                               # projection energy
         for isti, elist in ist2e.items():
@@ -225,21 +249,78 @@ def download_an_construct_matrix(mcc, weighting, ist2e, transgenic_line):
                         isti, len(elist), projmaps[isti]['matrix'].shape)
         if weighting == 1:                            # PD / ID
             injdensity = {}
-            all_experiments = mcc.get_experiments(dataframe=True,
-                                                  cre=transgenic_line)
+            # Use the DataFrame from dictionary_builder when available,
+            # avoiding a second get_experiments() call that may return
+            # a different ordering or set.
+            if experiments_df is not None:
+                all_experiments = experiments_df
+            else:
+                all_experiments = mcc.get_experiments(dataframe=True,
+                                                      cre=transgenic_line)
             for exp_id in all_experiments['id']:
                 inj_d = mcc.get_injection_density(exp_id, file_name=None)
-                injdensity[exp_id] = (
-                    np.sum(inj_d[0]) / np.count_nonzero(inj_d[0]))
+                nonzero = np.count_nonzero(inj_d[0])
+                if nonzero == 0:
+                    logger.warning(
+                        "Experiment %s has all-zero injection density; skipping",
+                        exp_id)
+                    continue
+                injdensity[exp_id] = np.sum(inj_d[0]) / nonzero
                 logger.info("Experiment id %s, total injection density %s",
                             exp_id, injdensity[exp_id])
-            for inj_id in range(len(list(projmaps.values()))):
-                index = 0
-                for exp_id in list(projmaps.values())[inj_id]['rows']:
-                    list(projmaps.values())[inj_id]['matrix'][index] /= \
-                        injdensity[exp_id]
-                    index += 1
+            for isti in list(projmaps):
+                pm = projmaps[isti]
+                # Build a mask of rows whose experiment has a valid density
+                kept = [i for i, eid in enumerate(pm['rows'])
+                        if eid in injdensity]
+                if not kept:
+                    logger.warning(
+                        "Injection site %s has no experiments with valid "
+                        "injection density; removing site", isti)
+                    del projmaps[isti]
+                    continue
+                # Divide kept rows by injection density
+                for idx in kept:
+                    eid = pm['rows'][idx]
+                    pm['matrix'][idx] /= injdensity[eid]
     return projmaps
+
+
+def _remove_target_columns(projmaps, remove_ids):
+    """Remove columns whose structure_id is in *remove_ids* from every map.
+
+    This is the shared logic for steps 3 of pms_cleaner and the column
+    removal in areas_volume_threshold / infected_threshold.
+    """
+    remove_set = set(remove_ids)
+    for inj_id in projmaps:
+        pm = projmaps[inj_id]
+        new_cols = []
+        keep_mask = []
+        for idx, col in enumerate(pm['columns']):
+            if col['structure_id'] not in remove_set:
+                new_cols.append(col)
+                keep_mask.append(idx)
+        pm['columns'] = new_cols
+        if len(keep_mask) > 0:
+            pm['matrix'] = pm['matrix'][:, keep_mask]
+        else:
+            pm['matrix'] = pm['matrix'][:, :0]
+
+
+def _find_nan_columns(projmaps):
+    """Return dict: inj_id → list of structure_ids whose column is all-NaN."""
+    nan_id = {}
+    for inj_id, pm in projmaps.items():
+        mat = pm['matrix']
+        # Find columns where every row is NaN
+        all_nan_mask = np.all(np.isnan(mat), axis=0)
+        for col_idx in np.where(all_nan_mask)[0]:
+            sid = pm['columns'][col_idx]['structure_id']
+            if inj_id not in nan_id:
+                nan_id[inj_id] = []
+            nan_id[inj_id].append(sid)
+    return nan_id
 
 
 def pms_cleaner(projmaps):
@@ -267,77 +348,38 @@ def pms_cleaner(projmaps):
             del projmaps[inj_id]
 
     # 3 — Target sites must be injection sites ---------------------------------
-    if len(sis0) != len(list(projmaps)):
-        for inj_id in range(len(list(projmaps.values()))):
-            targ_id = -1
-            while len(list(projmaps.values())[inj_id]['columns']) != \
-                    (3 * len(list(projmaps))):
-                targ_id += 1
-                col_struct = list(projmaps.values())[inj_id]['columns'][targ_id]
-                if col_struct['structure_id'] not in list(projmaps):
-                    del list(projmaps.values())[inj_id]['columns'][targ_id]
-                    list(projmaps.values())[inj_id]['matrix'] = np.delete(
-                        list(projmaps.values())[inj_id]['matrix'],
-                        targ_id, 1)
-                    targ_id = -1
+    injection_ids = set(projmaps.keys())
+    target_ids = set()
+    for pm in projmaps.values():
+        for col in pm['columns']:
+            target_ids.add(col['structure_id'])
+    extra_targets = target_ids - injection_ids
+    if extra_targets:
+        _remove_target_columns(projmaps, extra_targets)
 
     # 4 — Remove NaN-only areas iteratively ------------------------------------
-    nan_id = {}
-    for inj_id in projmaps:
-        mat = projmaps[inj_id]['matrix']
-        for targ_id in range(mat.shape[1]):
-            if all(np.isnan(mat[exp, targ_id])
-                   for exp in range(mat.shape[0])):
-                if inj_id not in nan_id:
-                    nan_id[inj_id] = []
-                nan_id[inj_id].append(
-                    projmaps[inj_id]['columns'][targ_id]['structure_id'])
-
-    while bool(nan_id):
-        remove = []
-        nan_inj_max = 0
-        # Find injection site with most NaN targets
-        while list(nan_id)[0] != nan_inj_max:
-            len_max = 0
-            for inj_id in list(nan_id):
-                if len(nan_id[inj_id]) > len_max:
-                    nan_inj_max = inj_id
-                    len_max = len(nan_id[inj_id])
-            if list(nan_id)[0] != nan_inj_max:
-                nan_id.pop(nan_inj_max)
-                remove.append(nan_inj_max)
-        if len(remove) == 0:
-            for inj_id in nan_id:
-                for target_id in nan_id[inj_id]:
-                    if target_id not in remove:
-                        remove.append(target_id)
-        for rem in remove:
-            if rem in list(projmaps):
-                projmaps.pop(rem)
-            for inj_id in range(len(list(projmaps))):
-                targ_id = -1
-                previous_size = len(list(projmaps.values())[inj_id]['columns'])
-                while len(list(projmaps.values())[inj_id]['columns']) != \
-                        (previous_size - 3):
-                    targ_id += 1
-                    column = list(projmaps.values())[inj_id]['columns'][targ_id]
-                    if column['structure_id'] == rem:
-                        del list(projmaps.values())[inj_id]['columns'][targ_id]
-                        list(projmaps.values())[inj_id]['matrix'] = np.delete(
-                            list(projmaps.values())[inj_id]['matrix'],
-                            targ_id, 1)
-                        targ_id = -1
-        # Re-evaluate NaN
-        nan_id = {}
-        for inj_id in projmaps:
-            mat = projmaps[inj_id]['matrix']
-            for targ_id in range(mat.shape[1]):
-                if all(np.isnan(mat[exp, targ_id])
-                       for exp in range(mat.shape[0])):
-                    if inj_id not in nan_id:
-                        nan_id[inj_id] = []
-                    nan_id[inj_id].append(
-                        projmaps[inj_id]['columns'][targ_id]['structure_id'])
+    # Find structure IDs whose column is all-NaN in every injection site that
+    # contains them.  Remove those structures (and any injection sites that
+    # are themselves all-NaN targets).  Repeat until stable.
+    for _ in range(100):  # safety bound; typically converges in 2-3 rounds
+        nan_id = _find_nan_columns(projmaps)
+        if not nan_id:
+            break
+        # Collect all structure IDs that have at least one all-NaN column
+        nan_structures = set()
+        for sid_list in nan_id.values():
+            nan_structures.update(sid_list)
+        # Any injection site that IS a nan_structure gets removed entirely
+        to_remove = nan_structures & set(projmaps.keys())
+        # All nan_structures get removed from columns
+        to_remove |= nan_structures
+        if not to_remove:
+            break
+        # Remove injection sites
+        for rid in list(to_remove & set(projmaps.keys())):
+            projmaps.pop(rid)
+        # Remove columns
+        _remove_target_columns(projmaps, to_remove)
 
     return projmaps
 
@@ -355,22 +397,25 @@ def areas_volume_threshold(mcc, projmaps, vol_thresh, resolution):
         if checkid not in id_ok:
             projmaps.pop(checkid, None)
     # Remove from target list (columns + matrix)
-    for inj_id in range(len(list(projmaps.values()))):
-        targ_id = -1
-        while len(list(projmaps.values())[inj_id]['columns']) != \
-                (len(id_ok) * 3):
-            targ_id += 1
-            col_struct = list(projmaps.values())[inj_id]['columns'][targ_id]
-            if col_struct['structure_id'] not in id_ok:
-                del list(projmaps.values())[inj_id]['columns'][targ_id]
-                list(projmaps.values())[inj_id]['matrix'] = np.delete(
-                    list(projmaps.values())[inj_id]['matrix'], targ_id, 1)
-                targ_id = -1
+    remove_ids = set(projmaps.keys()) - set(id_ok)
+    # Actually: remove ids that are NOT in id_ok but ARE columns
+    # We already removed keys from projmaps, need to remove their columns too
+    col_remove = set()
+    for pm in projmaps.values():
+        for col in pm['columns']:
+            if col['structure_id'] not in id_ok:
+                col_remove.add(col['structure_id'])
+    if col_remove:
+        _remove_target_columns(projmaps, col_remove)
     return projmaps
 
 
 def infected_threshold(mcc, projmaps, inj_f_threshold):
-    """Exclude experiments whose injected fraction is below *inj_f_threshold*."""
+    """Exclude experiments whose injected fraction is below *inj_f_threshold*.
+
+    After removing experiments from ``rows``, the corresponding rows in
+    ``matrix`` are also removed so that the two stay synchronised.
+    """
     id_ok = []
     for ID in projmaps:
         exp_not_accepted = []
@@ -385,27 +430,29 @@ def infected_threshold(mcc, projmaps, inj_f_threshold):
                          inj_info['sum_pixels'][0])
                 if inj_f < inj_f_threshold:
                     exp_not_accepted.append(exp)
-        if len(exp_not_accepted) < len(projmaps[ID]['rows']):
+        remaining = [e for e in projmaps[ID]['rows']
+                     if e not in set(exp_not_accepted)]
+        if len(remaining) < len(projmaps[ID]['rows']):
+            # Synchronise matrix rows with the remaining experiment list
+            pm = projmaps[ID]
+            kept_set = set(remaining)
+            keep_mask = [i for i, eid in enumerate(pm['rows'])
+                         if eid in kept_set]
+            pm['matrix'] = pm['matrix'][keep_mask]
+            pm['rows'] = remaining
+        if len(remaining) > 0:
             id_ok.append(ID)
-            projmaps[ID]['rows'] = list(
-                set(projmaps[ID]['rows']).difference(set(exp_not_accepted)))
     for checkid in list(projmaps):
         if checkid not in id_ok:
             projmaps.pop(checkid, None)
     # Remove from target list (columns + matrix)
-    for indexinj in range(len(list(projmaps.values()))):
-        indextarg = -1
-        while len(list(projmaps.values())[indexinj]['columns']) != \
-                (len(id_ok) * 3):
-            indextarg += 1
-            col_struct = list(projmaps.values()
-                              )[indexinj]['columns'][indextarg]
-            if col_struct['structure_id'] not in id_ok:
-                del list(projmaps.values())[indexinj]['columns'][indextarg]
-                list(projmaps.values())[indexinj]['matrix'] = np.delete(
-                    list(projmaps.values())[indexinj]['matrix'],
-                    indextarg, 1)
-                indextarg = -1
+    col_remove = set()
+    for pm in projmaps.values():
+        for col in pm['columns']:
+            if col['structure_id'] not in id_ok:
+                col_remove.add(col['structure_id'])
+    if col_remove:
+        _remove_target_columns(projmaps, col_remove)
     return projmaps
 
 
@@ -438,17 +485,12 @@ def construct_structural_conn(projmaps, order, key_ord):
 
         # Average over experiments, handling NaN
         if np.isnan(np.sum(matrix)):
-            matrix_temp = np.zeros((matrix.shape[1], 1), dtype=float)
+            matrix_temp = np.full((matrix.shape[1], 1), np.nan, dtype=float)
             for i in range(matrix.shape[1]):
-                if np.isnan(sum(matrix[:, i])):
-                    occ = 0
-                    for jj in range(matrix.shape[0]):
-                        if matrix[jj, i] == matrix[jj, i]:  # NaN != NaN
-                            occ += 1
-                            matrix_temp[i, 0] += matrix[jj, i]
-                    matrix_temp[i, 0] /= occ if occ else 1
-                else:
-                    matrix_temp[i, 0] = sum(matrix[:, i]) / matrix.shape[0]
+                non_nan = matrix[~np.isnan(matrix[:, i]), i]
+                if len(non_nan) > 0:
+                    matrix_temp[i, 0] = np.sum(non_nan) / matrix.shape[0]
+                # else: stays NaN — missing data is NaN, not zero
             matrix = matrix_temp
         else:
             matrix = (np.array([sum(matrix[:, i])
@@ -471,7 +513,10 @@ def construct_structural_conn(projmaps, order, key_ord):
     second_quarter = structural_conn[:, (structural_conn.shape[1] // 2):]
     sc_down = np.concatenate((second_quarter, first_quarter), axis=1)
     structural_conn = np.concatenate((structural_conn, sc_down), axis=0)
-    structural_conn /= np.amax(structural_conn)     # normalise
+    # Normalise — guard against all-zero matrix
+    max_val = np.amax(structural_conn)
+    if max_val > 0:
+        structural_conn /= max_val
     return structural_conn.T
 
 
@@ -582,16 +627,19 @@ def mouse_brain_visualizer(vol, order, key_ord,
     index_vec = 0
     for graph_ord_inj in key_ord:
         node_id = order[graph_ord_inj][0]
-        if node_id in vol_r:
-            vol_r[vol_r == node_id] = indexed_vec[index_vec]
-            vol_l[vol_l == node_id] = indexed_vec[index_vec + left]
+        # Fix: cast node_id to float64 for comparison with float64 voxel values
+        node_id_f = np.float64(node_id)
+        if node_id_f in vol_r:
+            vol_r[vol_r == node_id_f] = indexed_vec[index_vec]
+            vol_l[vol_l == node_id_f] = indexed_vec[index_vec + left]
         children = structure_tree.children([node_id])[0]
         child_ids = [c['id'] for c in children]
         while child_ids:
             cid = child_ids.pop(0)
-            if (cid in vol_r) and (cid not in projmaps):
-                vol_r[vol_r == cid] = indexed_vec[index_vec]
-                vol_l[vol_l == cid] = indexed_vec[index_vec + left]
+            cid_f = np.float64(cid)
+            if (cid_f in vol_r) and (cid not in projmaps):
+                vol_r[vol_r == cid_f] = indexed_vec[index_vec]
+                vol_l[vol_l == cid_f] = indexed_vec[index_vec + left]
         index_vec += 1
 
     vol_parcel = np.concatenate((vol_r, vol_l), axis=2)
@@ -603,8 +651,9 @@ def mouse_brain_visualizer(vol, order, key_ord,
     vol_l = vol_parcel[:, :, (vol.shape[2] // 2):].astype(np.float64)
 
     for node_id in not_assigned:
-        node_id = int(node_id)
-        st = structure_tree.get_structures_by_id([node_id])[0]
+        node_id_int = int(node_id)
+        node_id_f = np.float64(node_id_int)
+        st = structure_tree.get_structures_by_id([node_id_int])[0]
         if st is not None:
             ancestor = list(st['structure_id_path'])
         else:
@@ -612,8 +661,8 @@ def mouse_brain_visualizer(vol, order, key_ord,
         while ancestor:
             pp = ancestor[-1]
             if pp in unique_parents:
-                vol_r[vol_r == node_id] = indexed_vec[unique_parents[pp]]
-                vol_l[vol_l == node_id] = indexed_vec[unique_parents[pp] + left]
+                vol_r[vol_r == node_id_f] = indexed_vec[unique_parents[pp]]
+                vol_l[vol_l == node_id_f] = indexed_vec[unique_parents[pp] + left]
                 ancestor = []
             else:
                 ancestor.remove(pp)
@@ -626,8 +675,9 @@ def mouse_brain_visualizer(vol, order, key_ord,
     vol_l = vol_parcel[:, :, (vol.shape[2] // 2):].astype(np.float64)
 
     for node_id in not_assigned:
-        node_id = int(node_id)
-        st = structure_tree.get_structures_by_id([node_id])[0]
+        node_id_int = int(node_id)
+        node_id_f = np.float64(node_id_int)
+        st = structure_tree.get_structures_by_id([node_id_int])[0]
         if st is not None:
             ancestor = list(st['structure_id_path'])
         else:
@@ -635,8 +685,8 @@ def mouse_brain_visualizer(vol, order, key_ord,
         while ancestor:
             pp = ancestor[-1]
             if pp in unique_grandparents:
-                vol_r[vol_r == node_id] = indexed_vec[unique_grandparents[pp]]
-                vol_l[vol_l == node_id] = indexed_vec[unique_grandparents[pp] + left]
+                vol_r[vol_r == node_id_f] = indexed_vec[unique_grandparents[pp]]
+                vol_l[vol_l == node_id_f] = indexed_vec[unique_grandparents[pp] + left]
                 ancestor = []
             else:
                 ancestor.remove(pp)
@@ -654,17 +704,10 @@ def rotate_reference(allen):
     """Rotate Allen 3D reference (x1,y1,z1) → TVB reference (x2,y2,z2).
 
     Relationship: x1=z2, y1=x2, z1=y2.
+
+    Equivalent to the original two-pass slice loop but expressed as a
+    single vectorised :func:`numpy.transpose` + flip operation.
     """
-    # First rotation: x1=x2, y1=z2, z1=y2
-    vol_trans = np.zeros((allen.shape[0], allen.shape[2], allen.shape[1]),
-                         dtype=int)
-    for x in range(allen.shape[0]):
-        vol_trans[x, :, :] = allen[x, :, :][::-1].transpose()
-
-    # Second rotation: x1=z2, y1=x1, z1=y2
-    allen_rotate = np.zeros((allen.shape[2], allen.shape[0], allen.shape[1]),
-                            dtype=int)
-    for y in range(allen.shape[1]):
-        allen_rotate[:, :, y] = vol_trans[:, :, y].transpose()
-
-    return allen_rotate
+    # Original: first rotate (x, z, y) with y-flip, then rotate (z, x, y).
+    # The composition equals: transpose(2, 0, 1) with axis-0 reversed.
+    return np.transpose(allen, (2, 0, 1))[::-1].copy()
