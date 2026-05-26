@@ -35,13 +35,7 @@ the entire TVB stack, this tool provides:
 pip install git+https://github.com/maedoc/allen-mouse-connectivity.git
 ```
 
-Or, from PyPI (once published):
-
-```bash
-pip install allen-mouse-connectivity
-```
-
-If you prefer a local editable install for development:
+Or, from a local clone:
 
 ```bash
 git clone https://github.com/maedoc/allen-mouse-connectivity.git
@@ -54,14 +48,45 @@ network connection for the first data download.
 
 ## Quick start
 
+### Verify the installation
+
+```bash
+# Check that the package imports and the Allen API is reachable (seconds)
+python examples/demo.py --check
+```
+
+### Build connectivity (CLI)
+
 ```bash
 # Default parameters (100 µm, PD/ID weighting, 80 % injection fraction)
+# First run downloads ~3 GB from the Allen Institute; subsequent runs use cache.
 allen-mouse-connectivity --output-dir ./my_connectivity
 ```
 
-The first run downloads experimental data from the Allen Institute (typically
-a few GB depending on resolution).  Subsequent runs are fast thanks to disk
-caching.
+### Build connectivity (Python)
+
+```python
+from allen_mouse_connectivity import build_connectivity
+
+results = build_connectivity(
+    resolution=100,        # 100 µm (fastest; 25/50 for higher detail)
+    weighting=1,           # 1 = PD/ID, 2 = PD, 3 = energy
+    inj_f_thresh=0.8,      # 80% injection fraction threshold
+    vol_thresh=1e9,         # minimum region volume
+    cache_dir="./my_cache", # cache location (default: ~/.allen_mouse_cache)
+)
+
+print(results["weights"].shape)     # (2N, 2N)
+print(results["region_labels"])     # ['Right ...', 'Left ...', ...]
+print(results["n_regions"])         # number of regions (2N)
+```
+
+### Run the full demo
+
+```bash
+# Full pipeline: download data, build connectivity, validate, write output
+python examples/demo.py --full
+```
 
 ## Output files
 
@@ -115,21 +140,48 @@ The Allen SDK's `MouseConnectivityCache` handles caching automatically.
 Set `--cache-dir` to control where downloaded experiments and volumes are
 stored.  The default is `~/.allen_mouse_cache`.
 
-## Programmatic use
+First run at 100 µm downloads approximately 3 GB of projection density and
+annotation data.  25 µm and 50 µm resolutions require significantly more
+disk space.  All subsequent runs reuse the cached data and complete in
+seconds.
+
+## Testing
+
+```bash
+# Run the smoke test suite (includes minimal API connectivity check)
+python tests/test_smoke.py
+```
+
+The test suite verifies imports, CLI argument parsing, output writing, core
+pipeline functions (`pms_cleaner`, `rotate_reference`, `construct_structural_conn`),
+and a lightweight Allen API call.  It does **not** download full experiment
+data, making it suitable for CI.
+
+## Programmatic use — full reference
 
 ```python
 from allen_mouse_connectivity import build_connectivity
 
 results = build_connectivity(
-    resolution=100,
-    weighting=1,          # PD / ID
-    inj_f_thresh=0.8,
-    vol_thresh=1e9,
-    cache_dir="./my_cache",
+    resolution=100,           # 25, 50, or 100 µm
+    weighting=1,              # 1 = PD/ID, 2 = PD, 3 = energy
+    inj_f_thresh=0.8,         # min injection fraction (0.0–1.0)
+    vol_thresh=1e9,            # min region volume in µm³
+    cache_dir="./my_cache",    # cache directory
+    manifest_file=None,        # explicit manifest (overrides cache_dir)
+    transgenic_line=False,     # e.g. 'Emx1-IRES-Cre' or False for all
+    progress_callback=None,    # callable(stage_name, info_dict)
 )
 
-print(results["weights"].shape)     # (2N, 2N)
-print(results["region_labels"])     # ['Right ...', 'Left ...', ...]
+# Results dictionary keys:
+#   weights         — (2N, 2N) normalised connectivity matrix
+#   tract_lengths   — (2N, 2N) Euclidean tract lengths
+#   centres         — (2N, 3) region centre coordinates
+#   region_labels   — (2N,) region names ['Right ...', 'Left ...', ...]
+#   vol_parcel      — 3D integer array (parcellation volume)
+#   template        — 3D array (Allen template brain)
+#   resolution      — spatial resolution used
+#   n_regions       — total number of regions (2N = right + left)
 ```
 
 ## License
